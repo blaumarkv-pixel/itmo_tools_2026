@@ -27,54 +27,57 @@ on:
         required: false
         default: "2"
       required_markers:
-        description: "Обязательные pytest-маркеры (через запятую)"
+        description: "Обязательные pytest-маркеры (через запятую). Пусто = не проверять"
         required: false
         default: ""
-      strict:
-        description: "Строгий режим (WARN тоже валит CI)"
-        type: boolean
-        default: false
+      min_marked_tests:
+        description: "Минимум тестов на каждый маркер"
+        required: false
+        default: "1"
+      marker_for_negative:
+        description: "Маркер для негативных тестов (пусто = не требовать)"
+        required: false
+        default: ""
+      strict_mode:
+        description: "Строгость: lenient | normal | strict"
+        type: choice
+        options:
+          - lenient
+          - normal
+          - strict
+        default: "normal"
+      strict_sections:
+        description: "Секции, где WARN валит (через запятую; пусто = все при strict)"
+        required: false
+        default: ""
 
-# ============================================================
-# ВСЕ НАСТРОЙКИ В ОДНОМ МЕСТЕ
-# ============================================================
 env:
-  # ---------- Пути ----------
   SOURCE_PATH: ${{ github.event.inputs.source_path || 'Coffee/coffee.py' }}
   TEST_PATH: ${{ github.event.inputs.test_path || 'Coffee/test_coffe.py' }}
 
-  # ---------- Белые / чёрные списки ----------
-  # Только эти файлы считаются тестами проекта
   ALLOWED_TEST_FILES: "test_coffe.py"
-  # Эти файлы НИКОГДА не считаются тестами (даже если похожи)
   IGNORED_TEST_FILES: "test_server.py,test_legacy.py,test_draft.py"
-  # Только эти файлы считаются исходниками проекта
   ALLOWED_SOURCE_FILES: "coffee.py"
-  # Эти файлы НИКОГДА не считаются исходниками
   IGNORED_SOURCE_FILES: "test_server.py,main.py,geometry.py,test_coffe.py,conftest.py"
 
-  # ---------- Пороги ----------
   MIN_TESTS_PER_FN: ${{ github.event.inputs.min_tests_per_fn || '3' }}
   MIN_NEGATIVE_TESTS: ${{ github.event.inputs.min_negative_tests || '1' }}
   MIN_BOUNDARY_CATEGORIES: ${{ github.event.inputs.min_boundary_categories || '2' }}
-  REQUIRED_MARKERS: ${{ github.event.inputs.required_markers || '' }}
 
-  # ---------- Стили, которые считаем валидными ----------
-  # Негативные тесты: raises / warns / fail и их unittest-аналоги
+  REQUIRED_MARKERS: ${{ github.event.inputs.required_markers || '' }}
+  MIN_MARKED_TESTS: ${{ github.event.inputs.min_marked_tests || '1' }}
+  MARKER_FOR_NEGATIVE: ${{ github.event.inputs.marker_for_negative || '' }}
+
+  STRICT_MODE: ${{ github.event.inputs.strict_mode || 'normal' }}
+  STRICT_SECTIONS: ${{ github.event.inputs.strict_sections || '' }}
+  STRICT: ${{ github.event.inputs.strict_mode == 'strict' && 'true' || 'false' }}
+
   RAISES_STYLES: "raises,assertRaises,assertRaisesRegex,assertRaisesRegexp,warns,assertWarns,assertWarnsRegex,fail,assertRaisesMessage"
-  # Проверки типов
   TYPE_CHECK_STYLES: "isinstance,assertIsInstance,assertNotIsInstance,type"
-  # Способы проверки формата чека
   RECEIPT_CHECK_STYLES: "regex,substring,snapshot,parametrize"
 
-  # ---------- Наборы исключений ----------
-  # Базовые исключения проекта
   BASE_EXCEPTIONS: "TypeError,ValueError,KeyError,IndexError,AttributeError,ZeroDivisionError,AssertionError,StopIteration,OverflowError"
-  # Что считаем "тестом на неверные типы"
   TYPE_EXCEPTIONS: "TypeError,ValueError"
-
-  # ---------- Режим ----------
-  STRICT: ${{ github.event.inputs.strict || 'false' }}
 
 jobs:
   analyze-tests:
@@ -82,6 +85,7 @@ jobs:
     outputs:
       report_ok: ${{ steps.report.outputs.ok }}
       report_text: ${{ steps.report.outputs.text }}
+      achievement: ${{ steps.report.outputs.achievement }}
       tests_ok: ${{ steps.pytest.outputs.tests_ok }}
 
     steps:
@@ -105,8 +109,9 @@ jobs:
                    ALLOWED_TEST_FILES IGNORED_TEST_FILES \
                    ALLOWED_SOURCE_FILES IGNORED_SOURCE_FILES \
                    MIN_TESTS_PER_FN MIN_NEGATIVE_TESTS MIN_BOUNDARY_CATEGORIES REQUIRED_MARKERS \
+                   MIN_MARKED_TESTS MARKER_FOR_NEGATIVE \
                    RAISES_STYLES TYPE_CHECK_STYLES RECEIPT_CHECK_STYLES \
-                   BASE_EXCEPTIONS TYPE_EXCEPTIONS STRICT; do
+                   BASE_EXCEPTIONS TYPE_EXCEPTIONS STRICT_MODE STRICT_SECTIONS STRICT; do
             echo "$v=${!v}"
           done
 
@@ -268,6 +273,8 @@ jobs:
           MIN_NEGATIVE_TESTS = int(os.environ.get("MIN_NEGATIVE_TESTS", "1"))
           MIN_BOUNDARY_CATEGORIES = int(os.environ.get("MIN_BOUNDARY_CATEGORIES", "2"))
           REQUIRED_MARKERS = [m.strip() for m in os.environ.get("REQUIRED_MARKERS", "").split(",") if m.strip()]
+          MIN_MARKED_TESTS = int(os.environ.get("MIN_MARKED_TESTS", "1"))
+          MARKER_FOR_NEGATIVE = os.environ.get("MARKER_FOR_NEGATIVE", "").strip()
           STRICT = os.environ.get("STRICT", "false").lower() in ("true", "1", "yes")
           TESTS_OK = os.environ.get("TESTS_OK", "") == "true"
 
@@ -391,7 +398,6 @@ jobs:
                       n._source_file = str(sf)
                       all_fn_nodes.append(n)
 
-          # ключи (файл, имя) — дедупликация
           fn_keys = []
           for n in all_fn_nodes:
               key = (n._source_file, n.name)
@@ -677,13 +683,24 @@ jobs:
               missing_markers = []
               for marker in REQUIRED_MARKERS:
                   count = sum(1 for t in test_functions if has_marker(t, marker))
-                  if count == 0:
-                      missing_markers.append(marker)
+                  if count < MIN_MARKED_TESTS:
+                      missing_markers.append(f"{marker} ({count} < {MIN_MARKED_TESTS})")
                   else:
-                      add(f"Маркер @{marker}", "OK", f"{count} тестов")
+                      add(f"Маркер @{marker}", "OK", f"{count} тестов (>= {MIN_MARKED_TESTS})")
               if missing_markers:
                   add("Обязательные маркеры", "FAIL",
-                      f"не найдены маркеры: {missing_markers}")
+                      f"не хватает: {missing_markers}")
+
+          if MARKER_FOR_NEGATIVE:
+              unmarked_negative = [
+                  t.name for t in test_functions
+                  if is_negative(t) and not has_marker(t, MARKER_FOR_NEGATIVE)
+              ]
+              if unmarked_negative:
+                  add(f"Маркер @{MARKER_FOR_NEGATIVE} на негативных тестах", "FAIL",
+                      f"без маркера: {unmarked_negative[:10]}")
+              else:
+                  add(f"Маркер @{MARKER_FOR_NEGATIVE} на негативных тестах", "OK")
 
           # ---------- 11. Покрытие ----------
           try:
@@ -694,7 +711,6 @@ jobs:
               missing_by_file = {}
               for fp, data in cov["files"].items():
                   p = Path(fp)
-                  # пропускаем тестовые файлы и conftest
                   if p.name.startswith("test_") or p.name.endswith("_test.py") or p.name == "conftest.py":
                       continue
                   if p.name in IGNORED_TEST_FILES or p.name in ALLOWED_TEST_FILES:
@@ -734,6 +750,131 @@ jobs:
           except FileNotFoundError:
               add("Покрытие функций тестами", "WARN", "coverage.json не найден")
 
+          # ---------- 12. Забавные достижения ----------
+          def compute_achievement():
+              total_checks = len(report)
+              fails = len(problems)
+              warns = len(warnings)
+              passed = total_checks - fails - warns
+
+              has_positive = any(s == "Позитивные тесты" and st == "OK" for s, st, _ in report)
+              has_negative = any(s.startswith("Негативные тесты (") and st == "OK" for s, st, _ in report)
+              has_types = any(s == "Проверки типов" and st == "OK" for s, st, _ in report)
+              has_type_neg = any(s.startswith("Негативные тесты на неверные типы") and st == "OK"
+                                 for s, st, _ in report)
+              has_raises = any(s.startswith("Тесты на исключения") and st == "OK" for s, st, _ in report)
+              has_scenarios = any(s == "Сценарии по функциям" and st == "OK" for s, st, _ in report)
+              has_min = any(s == "Минимальное количество тестов" and st == "OK" for s, st, _ in report)
+              has_boundary = any(s == "Граничные значения" and st == "OK" for s, st, _ in report)
+              has_receipt = any(s == "Проверка формата чека" and st == "OK" for s, st, _ in report)
+              has_msg = any(s.startswith("Проверка текста исключений") and st == "OK"
+                            for s, st, _ in report)
+              coverage_ok = any(s.startswith("Покрытие") and st == "OK" for s, st, _ in report)
+
+              # Легендарные
+              if fails == 0 and warns == 0 and passed >= 10:
+                  return ("🏆 ЛЕГЕНДА КАМПУСА",
+                          "Ты прошёл все проверки без единого замечания. "
+                          "Преподаватель плачет от счастья, а латте в CampusCoffee — "
+                          "за счёт заведения. Ты готов писать тесты в Microsoft.")
+
+              if fails == 0 and warns <= 2 and passed >= 8:
+                  return ("🌟 ГУРУ ТЕСТИРОВАНИЯ",
+                          "Почти идеально. Пара мелочей — и ты станешь легендой. "
+                          "Держи бесплатный круассан и уважение потока.")
+
+              # Отличные
+              if fails <= 1 and passed >= 6:
+                  if has_negative and has_types and has_boundary:
+                      return ("🔥 СЕНЬОР-СТАЖЁР",
+                              "Позитив, негатив, типы, границы — всё на месте. "
+                              "Ты уже пишешь тесты лучше половины третьего курса. "
+                              "Кофе с собой бесплатно.")
+
+              if fails <= 2 and passed >= 5:
+                  if has_negative and has_raises:
+                      return ("🚀 ДЖУН ИНЖЕНЕР",
+                              "Ты понял главное: тест без проверки исключения — "
+                              "это не тест, а пожелание. Осталось дожать типы и границы.")
+
+              # Средние
+              if has_positive and has_negative:
+                  return ("☕ КОУЧ-СТАЖЁР",
+                          "Позитив и негатив есть — это уже 80% успеха. "
+                          "Добавь проверки типов и граничные значения, "
+                          "и тебя возьмут в стажёры в Яндекс.")
+
+              if has_positive and has_types:
+                  return ("📚 ПРИЛЕЖНЫЙ ПЕРВОКУРСНИК",
+                          "Тесты пишешь, типы проверяешь. Но забыл про негатив — "
+                          "а мир полон плохих входных данных. "
+                          "Прочитай главу про pytest.raises.")
+
+              if has_positive:
+                  return ("🐣 НАЧИНАЮЩИЙ ТЕСТЕР",
+                          "Первые тесты — это уже победа. Но код без негативных "
+                          "тестов — это дом без замка. Добавь негатив и исключения.")
+
+              # Слабые
+              if has_min:
+                  return ("🦆 УТЁНОК В СТАЕ",
+                          "Тестов вроде много, но они все про одно и то же. "
+                          "Количество не заменяет качество — добавь позитив/негатив/типы/границы.")
+
+              if any(s == "Запуск pytest" and st == "FAIL" for s, st, _ in report):
+                  return ("💀 КОД-ТЕРМИНАТОР",
+                          "Тесты падают. Возможно, ты тестируешь не тот код. "
+                          "Или нашёл баг в чужом коде и стесняешься сказать. "
+                          "Проверь логи и вернись.")
+
+              return ("🌱 РОСТОК",
+                      "Ты только в начале пути. Начни с одного теста на каждую функцию — "
+                      "и достижение не заставит себя ждать.")
+
+          achievement_title, achievement_text = compute_achievement()
+
+          # Считаем звёзды: passed / total
+          total_checks = len(report)
+          fails = len(problems)
+          warns = len(warnings)
+          passed = total_checks - fails - warns
+          stars = 0 if total_checks == 0 else min(5, max(1, round(5 * passed / total_checks)))
+          star_bar = "⭐" * stars + "☆" * (5 - stars)
+
+          print()
+          print("=" * 72)
+          print(f" ДОСТИЖЕНИЕ: {achievement_title}")
+          print("=" * 72)
+          print(f"  Рейтинг: {star_bar}  ({passed}/{total_checks} проверок пройдено)")
+          for line in achievement_text.split(". "):
+              line = line.strip()
+              if line:
+                  print(f"  {line}.")
+          print("=" * 72)
+          print()
+
+          report.append(("Достижение", "OK", achievement_title))
+
+          # ---------- Запись достижения в GITHUB_OUTPUT / STEP_SUMMARY ----------
+          # Достижение отдельным output, чтобы вывести в следующей job
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"achievement={achievement_title} — {star_bar}\n")
+
+          # Красивый summary
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as f:
+                  f.write(f"## Достижение: {achievement_title}\n\n")
+                  f.write(f"**Рейтинг:** {star_bar} ({passed}/{total_checks})\n\n")
+                  f.write(f"> {achievement_text}\n\n")
+                  f.write("### Сводка проверок\n\n")
+                  f.write("| Статус | Секция | Детали |\n")
+                  f.write("|---|---|---|\n")
+                  for s, st, d in report:
+                      emoji = "✅" if st == "OK" else ("⚠️" if st == "WARN" else "❌")
+                      f.write(f"| {emoji} {st} | {s} | {d or '—'} |\n")
+                  f.write("\n")
+
           finish()
           EOF
         env:
@@ -752,6 +893,8 @@ jobs:
           echo "--------------------------------------------------------------"
           echo -e "${{ needs.analyze-tests.outputs.report_text }}"
           echo "--------------------------------------------------------------"
+          echo "Достижение: ${{ needs.analyze-tests.outputs.achievement }}"
+          echo "--------------------------------------------------------------"
           echo "::error::Анализ тестов не пройден — см. отчёт выше"
           exit 1
 
@@ -765,5 +908,7 @@ jobs:
           echo "Отчёт анализа тестов:"
           echo "--------------------------------------------------------------"
           echo -e "${{ needs.analyze-tests.outputs.report_text }}"
+          echo "--------------------------------------------------------------"
+          echo "Достижение: ${{ needs.analyze-tests.outputs.achievement }}"
           echo "--------------------------------------------------------------"
           echo "Все проверки пройдены"
