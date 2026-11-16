@@ -105,32 +105,57 @@ jobs:
               elif status == "WARN":
                   warnings.append(f"{section}: {details}")
 
-          # 0. Результат pytest (из предыдущего шага)
+          # ---------- Помощники ----------
+          def has_pytest_raises(node):
+              """pytest.raises(...) или self.assertRaises(...)"""
+              for sub in ast.walk(node):
+                  if not isinstance(sub, ast.Call):
+                      continue
+                  f = sub.func
+                  # pytest.raises
+                  if isinstance(f, ast.Attribute) and f.attr in ("raises", "assertRaises"):
+                      return True
+                  # assertRaises как bare Name (from unittest import ...)
+                  if isinstance(f, ast.Name) and f.id in ("raises", "assertRaises"):
+                      return True
+              return False
+
+          def is_negative_test(node):
+              return has_pytest_raises(node)
+
+          def raises_targets(node):
+              """Какие исключения проверяются в этом тесте (имена TypeError/ValueError/etc)."""
+              names = set()
+              for sub in ast.walk(node):
+                  if isinstance(sub, ast.Call):
+                      f = sub.func
+                      if (isinstance(f, ast.Attribute) and f.attr in ("raises", "assertRaises")) or \
+                         (isinstance(f, ast.Name) and f.id in ("raises", "assertRaises")):
+                          for arg in sub.args:
+                              if isinstance(arg, ast.Name):
+                                  names.add(arg.id)
+                              elif isinstance(arg, ast.Tuple):
+                                  for el in arg.elts:
+                                      if isinstance(el, ast.Name):
+                                          names.add(el.id)
+              return names
+
+          # 0. pytest
           tests_ok = os.environ.get("TESTS_OK", "") == "true"
-          if tests_ok:
-              add("Запуск pytest", "OK", "все тесты прошли")
-          else:
-              add("Запуск pytest", "FAIL",
-                  "есть падающие тесты (см. лог шага 'Run tests with coverage')")
+          add("Запуск pytest",
+              "OK" if tests_ok else "FAIL",
+              "все тесты прошли" if tests_ok else "есть падающие тесты (см. лог)")
 
           # 1. Позитивные / негативные
-          def has_raises(node):
-              return any(
-                  isinstance(s, ast.Call)
-                  and isinstance(s.func, ast.Attribute)
-                  and s.func.attr == "raises"
-                  for s in ast.walk(node)
-              )
-
-          positive = [t.name for t in test_functions if not has_raises(t)]
-          negative = [t.name for t in test_functions if has_raises(t)]
+          positive = [t.name for t in test_functions if not is_negative_test(t)]
+          negative = [t.name for t in test_functions if is_negative_test(t)]
 
           add("Позитивные тесты",
               "OK" if positive else "FAIL",
               f"{len(positive)} тестов" if positive else "нет позитивных тестов")
-          add("Негативные тесты (pytest.raises)",
+          add("Негативные тесты (pytest.raises / self.assertRaises)",
               "OK" if negative else "FAIL",
-              f"{len(negative)} тестов" if negative else "нет тестов с pytest.raises")
+              f"{len(negative)} тестов" if negative else "нет тестов с pytest.raises/self.assertRaises")
 
           # 2. isinstance
           has_isinstance = any(
@@ -143,22 +168,16 @@ jobs:
               "OK" if has_isinstance else "FAIL",
               "" if has_isinstance else "не найдено ни одной проверки isinstance")
 
-          # 3. Негативные тесты на типы
+          # 3. Негативные тесты на типы/значения (TypeError/ValueError)
           type_errors = {"TypeError", "ValueError"}
-          has_type_err = False
-          for node in ast.walk(tree):
-              if isinstance(node, ast.Call):
-                  f = node.func
-                  if isinstance(f, ast.Attribute) and f.attr == "raises":
-                      for arg in node.args:
-                          if isinstance(arg, ast.Name) and arg.id in type_errors:
-                              has_type_err = True
-                              break
-                  if has_type_err:
-                      break
-          add("Негативные тесты на неверные типы",
-              "OK" if has_type_err else "FAIL",
-              "" if has_type_err else "нет pytest.raises(TypeError|ValueError)")
+          found_type_errors = set()
+          for node in test_functions:
+              if is_negative_test(node):
+                  found_type_errors |= (raises_targets(node) & type_errors)
+          add("Негативные тесты на неверные типы (TypeError/ValueError)",
+              "OK" if found_type_errors else "FAIL",
+              f"проверяются: {sorted(found_type_errors)}" if found_type_errors
+              else "нет pytest.raises(TypeError|ValueError) / self.assertRaises(TypeError|ValueError)")
 
           # 4. Функции с raise -> есть тест на исключение
           functions_with_raise = []
@@ -171,7 +190,7 @@ jobs:
 
           tested = set()
           for node in test_functions:
-              if not has_raises(node):
+              if not is_negative_test(node):
                   continue
               for sub in ast.walk(node):
                   if isinstance(sub, ast.Call):
@@ -188,7 +207,7 @@ jobs:
           # 5. Сценарии по функциям
           per_fn = {name: {"positive": 0, "negative": 0, "types": 0} for name in fn_names}
           for node in test_functions:
-              neg = has_raises(node)
+              neg = is_negative_test(node)
               called = set()
               for sub in ast.walk(node):
                   if isinstance(sub, ast.Call):
