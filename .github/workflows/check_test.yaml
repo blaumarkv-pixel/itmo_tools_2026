@@ -1,0 +1,335 @@
+name: CI - Tests on Tag
+
+on:
+  push:
+    tags:
+      - '*'  # триггер на любой тег
+
+jobs:
+  analyze-tests:
+    runs-on: ubuntu-latest
+    outputs:
+      report_ok: ${{ steps.report.outputs.ok }}
+      report_text: ${{ steps.report.outputs.text }}
+      tests_ok: ${{ steps.pytest.outputs.tests_ok }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov coverage
+
+      - name: Run tests with coverage (do not fail job here)
+        id: pytest
+        run: |
+          set +e
+          coverage run --branch -m pytest Coffee/test_coffe.py -v
+          PYTEST_EXIT=$?
+          coverage report -m || true
+          coverage json -o coverage.json || true
+          if [ "$PYTEST_EXIT" -eq 0 ]; then
+            echo "tests_ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tests_ok=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "pytest exit code: $PYTEST_EXIT (job продолжается, статус уйдёт в отчёт)"
+          exit 0
+
+      - name: Analyze coverage and tests (never fails)
+        id: report
+        run: |
+          python - <<'EOF'
+          import ast
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          # ---------- Поиск тестового файла ----------
+          test_file = Path("Coffee/test_coffe.py")
+          if not test_file.exists():
+              alt = list(Path(".").glob("**/test_coffe.py"))
+              if alt:
+                  test_file = alt[0]
+              else:
+                  with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                      f.write("ok=false\n")
+                      f.write("text<<REPORT_EOF\n")
+                      f.write("Файл с тестами test_coffe.py не найден\n")
+                      f.write("REPORT_EOF\n")
+                  print("Файл с тестами не найден")
+                  sys.exit(0)
+
+          source_text = test_file.read_text(encoding="utf-8")
+          tree = ast.parse(source_text)
+
+          test_functions = [
+              n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name.startswith("test_")
+          ]
+
+          # ---------- Поиск исходника ----------
+          src_candidates = [
+              p for p in list(Path("Coffee").glob("*.py")) + list(Path(".").glob("*.py"))
+              if p.name != "test_coffe.py" and not p.name.startswith("test_")
+          ]
+          if not src_candidates:
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("ok=false\n")
+                  f.write("text<<REPORT_EOF\n")
+                  f.write("Не найден исходный файл с кодом\n")
+                  f.write("REPORT_EOF\n")
+              print("Не найден исходный файл")
+              sys.exit(0)
+          source_file = src_candidates[0]
+          src_tree = ast.parse(source_file.read_text(encoding="utf-8"))
+          fn_names = [n.name for n in ast.walk(src_tree) if isinstance(n, ast.FunctionDef)]
+
+          report = []
+          problems = []
+          warnings = []
+
+          def add(section, status, details=""):
+              report.append((section, status, details))
+              if status == "FAIL":
+                  problems.append(f"{section}: {details}")
+              elif status == "WARN":
+                  warnings.append(f"{section}: {details}")
+
+          # 0. Результат pytest (из предыдущего шага)
+          tests_ok = os.environ.get("TESTS_OK", "") == "true"
+          if tests_ok:
+              add("Запуск pytest", "OK", "все тесты прошли")
+          else:
+              add("Запуск pytest", "FAIL",
+                  "есть падающие тесты (см. лог шага 'Run tests with coverage')")
+
+          # 1. Позитивные / негативные
+          def has_raises(node):
+              return any(
+                  isinstance(s, ast.Call)
+                  and isinstance(s.func, ast.Attribute)
+                  and s.func.attr == "raises"
+                  for s in ast.walk(node)
+              )
+
+          positive = [t.name for t in test_functions if not has_raises(t)]
+          negative = [t.name for t in test_functions if has_raises(t)]
+
+          add("Позитивные тесты",
+              "OK" if positive else "FAIL",
+              f"{len(positive)} тестов" if positive else "нет позитивных тестов")
+          add("Негативные тесты (pytest.raises)",
+              "OK" if negative else "FAIL",
+              f"{len(negative)} тестов" if negative else "нет тестов с pytest.raises")
+
+          # 2. isinstance
+          has_isinstance = any(
+              isinstance(n, ast.Call)
+              and isinstance(n.func, ast.Name)
+              and n.func.id == "isinstance"
+              for n in ast.walk(tree)
+          )
+          add("Проверки типов (isinstance)",
+              "OK" if has_isinstance else "FAIL",
+              "" if has_isinstance else "не найдено ни одной проверки isinstance")
+
+          # 3. Негативные тесты на типы
+          type_errors = {"TypeError", "ValueError"}
+          has_type_err = False
+          for node in ast.walk(tree):
+              if isinstance(node, ast.Call):
+                  f = node.func
+                  if isinstance(f, ast.Attribute) and f.attr == "raises":
+                      for arg in node.args:
+                          if isinstance(arg, ast.Name) and arg.id in type_errors:
+                              has_type_err = True
+                              break
+                  if has_type_err:
+                      break
+          add("Негативные тесты на неверные типы",
+              "OK" if has_type_err else "FAIL",
+              "" if has_type_err else "нет pytest.raises(TypeError|ValueError)")
+
+          # 4. Функции с raise -> есть тест на исключение
+          functions_with_raise = []
+          for node in ast.walk(src_tree):
+              if isinstance(node, ast.FunctionDef):
+                  for sub in ast.walk(node):
+                      if isinstance(sub, ast.Raise):
+                          functions_with_raise.append(node.name)
+                          break
+
+          tested = set()
+          for node in test_functions:
+              if not has_raises(node):
+                  continue
+              for sub in ast.walk(node):
+                  if isinstance(sub, ast.Call):
+                      f = sub.func
+                      name = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else None)
+                      if name in functions_with_raise:
+                          tested.add(name)
+
+          not_tested = [f for f in functions_with_raise if f not in tested]
+          add("Тесты на исключения для функций с raise",
+              "OK" if not not_tested else "FAIL",
+              "" if not not_tested else f"не покрыты: {not_tested}")
+
+          # 5. Сценарии по функциям
+          per_fn = {name: {"positive": 0, "negative": 0, "types": 0} for name in fn_names}
+          for node in test_functions:
+              neg = has_raises(node)
+              called = set()
+              for sub in ast.walk(node):
+                  if isinstance(sub, ast.Call):
+                      f = sub.func
+                      name = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else None)
+                      if name in fn_names:
+                          called.add(name)
+              for name in called:
+                  if neg:
+                      per_fn[name]["negative"] += 1
+                  else:
+                      per_fn[name]["positive"] += 1
+              if any(isinstance(s, ast.Call) and isinstance(s.func, ast.Name) and s.func.id == "isinstance"
+                     for s in ast.walk(node)):
+                  for name in called:
+                      per_fn[name]["types"] += 1
+
+          scenario_problems = []
+          for name, st in per_fn.items():
+              if st["positive"] == 0:
+                  scenario_problems.append(f"{name}: нет позитивных тестов")
+              if name in functions_with_raise and st["negative"] == 0:
+                  scenario_problems.append(f"{name}: нет негативного теста")
+              if name in ("get_most_expensive_drink", "generate_wifi_password") and st["types"] == 0:
+                  scenario_problems.append(f"{name}: нет проверки типа возврата")
+          add("Сценарии по функциям (позитив/негатив/типы)",
+              "OK" if not scenario_problems else "FAIL",
+              "; ".join(scenario_problems))
+
+          # 6. Минимум тестов
+          min_required = len(fn_names) * 3
+          add("Минимальное количество тестов",
+              "OK" if len(test_functions) >= min_required else "FAIL",
+              f"{len(test_functions)} тестов (требуется >= {min_required} для {len(fn_names)} функций)")
+
+          # 7. Граничные значения
+          has_zero = re.search(r"\b0\b", source_text) is not None
+          has_negative = re.search(r"-\d", source_text) is not None
+          has_empty_str = '""' in source_text or "''" in source_text
+          has_none = "None" in source_text
+          boundary = []
+          if not has_zero: boundary.append("нет нуля")
+          if not has_negative: boundary.append("нет отрицательных")
+          if not has_empty_str: boundary.append("нет пустых строк")
+          if not has_none: boundary.append("нет None")
+          add("Граничные значения (0, отрицательные, '', None)",
+              "OK" if not boundary else "FAIL",
+              ", ".join(boundary))
+
+          # 8. Регулярки для format_receipt
+          if "format_receipt" in fn_names:
+              has_regex = "re." in source_text or "import re" in source_text
+              add("Проверка формата чека регуляркой",
+                  "OK" if has_regex else "WARN",
+                  "" if has_regex else "регулярные выражения не используются")
+
+          # 9. Покрытие
+          try:
+              with open("coverage.json") as f:
+                  cov = json.load(f)
+              executed_lines = set()
+              missing_lines = set()
+              for file_path, data in cov["files"].items():
+                  if file_path.endswith(source_file.name):
+                      executed_lines = set(data["executed_lines"])
+                      missing_lines = set(data["missing_lines"])
+
+              uncovered = [n.name for n in ast.walk(src_tree)
+                           if isinstance(n, ast.FunctionDef)
+                           and not (set(range(n.lineno, n.end_lineno + 1)) & executed_lines)]
+              add("Покрытие функций тестами",
+                  "OK" if not uncovered else "FAIL",
+                  "" if not uncovered else f"не покрыты: {uncovered}")
+              if missing_lines:
+                  add("Покрытие строк (все ветки)",
+                      "FAIL",
+                      f"непокрытые строки: {sorted(missing_lines)}")
+              else:
+                  add("Покрытие строк (все ветки)", "OK", "100% строк покрыто")
+          except FileNotFoundError:
+              add("Покрытие функций тестами", "WARN", "coverage.json не найден")
+
+          # ---------- Печать отчёта ----------
+          print()
+          print("=" * 72)
+          print(" ОТЧЁТ О ПРОВЕРКЕ ТЕСТОВ")
+          print("=" * 72)
+          for section, status, details in report:
+              line = f"  [{status:4}] {section}"
+              if details:
+                  line += f" — {details}"
+              print(line)
+          print("=" * 72)
+          if problems:
+              print(f"РЕЗУЛЬТАТ: FAIL — проблем: {len(problems)}")
+              for p in problems:
+                  print(f"  ✗ {p}")
+          else:
+              print("РЕЗУЛЬТАТ: OK — все проверки пройдены")
+          if warnings:
+              print(f"ПРЕДУПРЕЖДЕНИЯ ({len(warnings)}):")
+              for w in warnings:
+                  print(f"  ! {w}")
+          print("=" * 72)
+
+          report_text = "\\n".join(
+              f"[{status}] {section}" + (f" — {details}" if details else "")
+              for section, status, details in report
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"ok={'true' if not problems else 'false'}\n")
+              f.write("text<<REPORT_EOF\n")
+              f.write(report_text + "\n")
+              f.write("REPORT_EOF\n")
+          EOF
+        env:
+          TESTS_OK: ${{ steps.pytest.outputs.tests_ok }}
+
+  fail-if-report-not-ok:
+    needs: analyze-tests
+    runs-on: ubuntu-latest
+    if: needs.analyze-tests.outputs.report_ok != 'true'
+    steps:
+      - name: Show report and fail
+        run: |
+          echo "Отчёт анализа тестов:"
+          echo "--------------------------------------------------------------"
+          echo -e "${{ needs.analyze-tests.outputs.report_text }}"
+          echo "--------------------------------------------------------------"
+          echo "::error::Анализ тестов не пройден — см. отчёт выше"
+          exit 1
+
+  success:
+    needs: analyze-tests
+    runs-on: ubuntu-latest
+    if: needs.analyze-tests.outputs.report_ok == 'true'
+    steps:
+      - name: Confirm success
+        run: |
+          echo "Отчёт анализа тестов:"
+          echo "--------------------------------------------------------------"
+          echo -e "${{ needs.analyze-tests.outputs.report_text }}"
+          echo "--------------------------------------------------------------"
+          echo "Все проверки пройдены"
