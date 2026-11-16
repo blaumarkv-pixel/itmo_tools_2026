@@ -25,7 +25,7 @@ jobs:
 
       - name: Run tests with coverage
         run: |
-          coverage run --branch -m pytest test_coffe.py -v
+          coverage run --branch -m pytest Coffee/test_coffe.py -v
           coverage report -m
           coverage json -o coverage.json
 
@@ -38,8 +38,10 @@ jobs:
           import json
           from pathlib import Path
 
+          # ---------- Поиск исходного файла ----------
+          # Приоритет: файлы в Coffee/, затем в корне
           candidates = [
-              p for p in Path(".").glob("*.py")
+              p for p in list(Path("Coffee").glob("*.py")) + list(Path(".").glob("*.py"))
               if p.name != "test_coffe.py" and not p.name.startswith("test_")
           ]
           if not candidates:
@@ -52,6 +54,7 @@ jobs:
           functions = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
           print(f"Найдены функции: {functions}")
 
+          # ---------- Покрытие ----------
           with open("coverage.json") as f:
               cov = json.load(f)
 
@@ -84,18 +87,20 @@ jobs:
           print("100% строк покрыто — все ветки проверены")
           EOF
 
-      - name: Verify positive and negative tests exist
+      - name: Verify positive/negative tests, types and exceptions
         run: |
-          echo "Проверка наличия позитивных и негативных тестов, проверок типов и исключений..."
+          echo "Анализ тестов..."
           python - <<'EOF'
           import ast
           import sys
           import re
+          import json
           from pathlib import Path
 
-          test_file = Path("test_coffe.py")
+          # ---------- Поиск тестового файла ----------
+          test_file = Path("Coffee/test_coffe.py")
           if not test_file.exists():
-              print("Файл с тестами test_coffe.py не найден")
+              print(f"Файл с тестами не найден: {test_file}")
               sys.exit(1)
 
           source_text = test_file.read_text(encoding="utf-8")
@@ -110,64 +115,82 @@ jobs:
               print("ОШИБКА: нет тестовых функций")
               sys.exit(1)
 
-          # ---------- 1. Наличие позитивных и негативных тестов ----------
+          # ---------- Поиск исходника ----------
+          src_candidates = [
+              p for p in list(Path("Coffee").glob("*.py")) + list(Path(".").glob("*.py"))
+              if p.name != "test_coffe.py" and not p.name.startswith("test_")
+          ]
+          if not src_candidates:
+              print("ОШИБКА: не найден исходный файл")
+              sys.exit(1)
+          source_file = src_candidates[0]
+          src_tree = ast.parse(source_file.read_text(encoding="utf-8"))
+          fn_names = [n.name for n in ast.walk(src_tree) if isinstance(n, ast.FunctionDef)]
+          print(f"Функции в исходнике: {fn_names}")
+
+          # ---------- Отчёт ----------
+          report = []
+          errors = []
+
+          def add_report(section, status, details=""):
+              report.append((section, status, details))
+              if status == "FAIL":
+                  errors.append(f"{section}: {details}")
+
+          # 1. Позитивные / негативные тесты
           def has_raises(node):
               return any(
-                  isinstance(sub, ast.Call)
-                  and isinstance(sub.func, ast.Attribute)
-                  and sub.func.attr == "raises"
-                  for sub in ast.walk(node)
+                  isinstance(s, ast.Call)
+                  and isinstance(s.func, ast.Attribute)
+                  and s.func.attr == "raises"
+                  for s in ast.walk(node)
               )
 
           positive = [t.name for t in test_functions if not has_raises(t)]
           negative = [t.name for t in test_functions if has_raises(t)]
 
-          if not positive:
-              print("ОШИБКА: нет позитивных тестов (без pytest.raises)")
-              sys.exit(1)
-          if not negative:
-              print("ОШИБКА: нет негативных тестов (pytest.raises)")
-              sys.exit(1)
-          print(f"Позитивных тестов: {len(positive)}, негативных: {len(negative)}")
+          if positive:
+              add_report("Позитивные тесты", "OK", f"{len(positive)} тестов")
+          else:
+              add_report("Позитивные тесты", "FAIL", "нет позитивных тестов")
+          if negative:
+              add_report("Негативные тесты", "OK", f"{len(negative)} тестов")
+          else:
+              add_report("Негативные тесты", "FAIL", "нет тестов с pytest.raises")
 
-          # ---------- 2. Проверки типов (isinstance) ----------
+          # 2. isinstance
           has_isinstance = any(
               isinstance(n, ast.Call)
               and isinstance(n.func, ast.Name)
               and n.func.id == "isinstance"
               for n in ast.walk(tree)
           )
-          if not has_isinstance:
-              print("ОШИБКА: нет проверок типов данных (isinstance)")
-              sys.exit(1)
-          print("Проверки типов (isinstance) найдены")
+          add_report(
+              "Проверки типов (isinstance)",
+              "OK" if has_isinstance else "FAIL",
+              "" if has_isinstance else "не найдено ни одной проверки isinstance",
+          )
 
-          # ---------- 3. Негативные тесты на неверные типы ----------
+          # 3. Негативные тесты на типы
           type_errors = {"TypeError", "ValueError"}
-          has_type_or_value_error = False
+          has_type_err = False
           for node in ast.walk(tree):
               if isinstance(node, ast.Call):
                   f = node.func
                   if isinstance(f, ast.Attribute) and f.attr == "raises":
                       for arg in node.args:
                           if isinstance(arg, ast.Name) and arg.id in type_errors:
-                              has_type_or_value_error = True
+                              has_type_err = True
                               break
-                  if has_type_or_value_error:
+                  if has_type_err:
                       break
-          if not has_type_or_value_error:
-              print("ОШИБКА: нет негативных тестов на типы (pytest.raises(TypeError|ValueError))")
-              sys.exit(1)
-          print("Негативные тесты на типы найдены")
+          add_report(
+              "Негативные тесты на типы",
+              "OK" if has_type_err else "FAIL",
+              "" if has_type_err else "нет pytest.raises(TypeError|ValueError)",
+          )
 
-          # ---------- 4. Для каждой функции с raise есть тест на исключение ----------
-          source_candidates = [
-              p for p in Path(".").glob("*.py")
-              if p.name != "test_coffe.py" and not p.name.startswith("test_")
-          ]
-          source_file = source_candidates[0]
-          src_tree = ast.parse(source_file.read_text(encoding="utf-8"))
-
+          # 4. Для каждой функции с raise есть тест на исключение
           functions_with_raise = []
           for node in ast.walk(src_tree):
               if isinstance(node, ast.FunctionDef):
@@ -175,7 +198,6 @@ jobs:
                       if isinstance(sub, ast.Raise):
                           functions_with_raise.append(node.name)
                           break
-          print(f"Функции с raise: {functions_with_raise}")
 
           tested = set()
           for node in test_functions:
@@ -184,29 +206,19 @@ jobs:
               for sub in ast.walk(node):
                   if isinstance(sub, ast.Call):
                       f = sub.func
-                      name = None
-                      if isinstance(f, ast.Name):
-                          name = f.id
-                      elif isinstance(f, ast.Attribute):
-                          name = f.attr
+                      name = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else None)
                       if name in functions_with_raise:
                           tested.add(name)
 
           not_tested = [f for f in functions_with_raise if f not in tested]
-          if not_tested:
-              print("ОШИБКА: для функций с raise нет тестов на исключения:")
-              for f in not_tested:
-                  print(f"  - {f}")
-              sys.exit(1)
-          print("Для всех функций с raise есть тесты на исключения")
+          add_report(
+              "Тесты на исключения для функций с raise",
+              "OK" if not not_tested else "FAIL",
+              "" if not not_tested else f"не покрыты: {not_tested}",
+          )
 
-          # ---------- 5. Проверка сценариев по каждой функции ----------
-          # Для каждой функции требуем: >=2 позитивных и >=1 негативный тест,
-          # либо (если функция не бросает исключений) — >=1 позитивный и граничный тест
-          fn_names = [n.name for n in ast.walk(src_tree) if isinstance(n, ast.FunctionDef)]
-
-          # группируем тесты по вызываемым функциям
-          per_fn_tests = {name: {"positive": 0, "negative": 0, "types": 0} for name in fn_names}
+          # 5. Сценарии по каждой функции
+          per_fn = {name: {"positive": 0, "negative": 0, "types": 0} for name in fn_names}
           for node in test_functions:
               neg = has_raises(node)
               called = set()
@@ -218,76 +230,81 @@ jobs:
                           called.add(name)
               for name in called:
                   if neg:
-                      per_fn_tests[name]["negative"] += 1
+                      per_fn[name]["negative"] += 1
                   else:
-                      per_fn_tests[name]["positive"] += 1
-              # проверки типов внутри тестов
+                      per_fn[name]["positive"] += 1
               if any(isinstance(s, ast.Call) and isinstance(s.func, ast.Name) and s.func.id == "isinstance"
                      for s in ast.walk(node)):
                   for name in called:
-                      per_fn_tests[name]["types"] += 1
+                      per_fn[name]["types"] += 1
 
-          print("Сценарии по функциям:", per_fn_tests)
+          scenario_problems = []
+          for name, st in per_fn.items():
+              if st["positive"] == 0:
+                  scenario_problems.append(f"{name}: нет позитивных тестов")
+              if name in functions_with_raise and st["negative"] == 0:
+                  scenario_problems.append(f"{name}: нет негативного теста")
+              if name in ("get_most_expensive_drink", "generate_wifi_password") and st["types"] == 0:
+                  scenario_problems.append(f"{name}: нет проверки типа возврата")
 
-          problems = []
-          for name, stats in per_fn_tests.items():
-              # у каждой функции должен быть хотя бы один позитивный тест
-              if stats["positive"] == 0:
-                  problems.append(f"{name}: нет позитивных тестов")
-              # если функция бросает исключения — нужен негативный
-              if name in functions_with_raise and stats["negative"] == 0:
-                  problems.append(f"{name}: нет негативного теста (функция бросает исключения)")
-              # для функций с возвратом составного типа — нужна проверка типа
-              if name in ("get_most_expensive_drink", "generate_wifi_password") and stats["types"] == 0:
-                  problems.append(f"{name}: нет проверки типа возврата (isinstance)")
+          add_report(
+              "Сценарии по функциям (позитив/негатив/типы)",
+              "OK" if not scenario_problems else "FAIL",
+              "; ".join(scenario_problems),
+          )
 
-          # хотя бы одна проверка типов в целом по критичным функциям
-          critical_type_funcs = {"get_most_expensive_drink", "generate_wifi_password"}
-          for ctf in critical_type_funcs:
-              if ctf in per_fn_tests and per_fn_tests[ctf]["types"] == 0 and not any(
-                  ctf in p for p in problems
-              ):
-                  # не дублируем, если уже добавили
-                  pass
+          # 6. Минимум тестов
+          min_required = len(fn_names) * 3
+          add_report(
+              "Минимальное количество тестов",
+              "OK" if len(test_functions) >= min_required else "FAIL",
+              f"{len(test_functions)} тестов (требуется >= {min_required} для {len(fn_names)} функций)",
+          )
 
-          if problems:
-              print("ОШИБКА: не все сценарии покрыты:")
-              for p in problems:
-                  print(f"  - {p}")
-              sys.exit(1)
-          print("Все сценарии по функциям покрыты (позитив/негатив/типы)")
-
-          # ---------- 6. Минимум по общему числу тестов (эвристика на "все возможные сценарии") ----------
-          # Для 5+ функций ожидаем >= 15 тестов (по ~3 на функцию: позитив/граница/негатив)
-          if len(fn_names) >= 4 and len(test_functions) < len(fn_names) * 3:
-              print(f"ОШИБКА: слишком мало тестов ({len(test_functions)}) для {len(fn_names)} функций — ожидается >= {len(fn_names)*3}")
-              sys.exit(1)
-
-          # ---------- 7. Проверка наличия граничных значений (0, отрицательные, пустые) ----------
-          # ищем в тестах литералы 0, -1, "", None
+          # 7. Граничные значения
           has_zero = re.search(r"\b0\b", source_text) is not None
           has_negative = re.search(r"-\d", source_text) is not None
           has_empty_str = '""' in source_text or "''" in source_text
           has_none = "None" in source_text
 
-          if not has_zero:
-              print("ОШИБКА: нет граничных тестов с нулём")
-              sys.exit(1)
-          if not has_negative:
-              print("ОШИБКА: нет негативных тестов с отрицательными значениями")
-              sys.exit(1)
-          if not has_empty_str:
-              print("ОШИБКА: нет тестов с пустыми строками")
-              sys.exit(1)
-          if not has_none:
-              print("ОШИБКА: нет тестов с None")
-              sys.exit(1)
-          print("Граничные значения (0, отрицательные, пустые строки, None) присутствуют в тестах")
+          boundary = []
+          if not has_zero: boundary.append("нет нуля")
+          if not has_negative: boundary.append("нет отрицательных")
+          if not has_empty_str: boundary.append("нет пустых строк")
+          if not has_none: boundary.append("нет None")
+          add_report(
+              "Граничные значения (0, отрицательные, '', None)",
+              "OK" if not boundary else "FAIL",
+              ", ".join(boundary),
+          )
 
-          # ---------- 8. Проверка регулярных выражений (для формата чека) ----------
+          # 8. Регулярки для format_receipt
           if "format_receipt" in fn_names:
-              if "re." not in source_text and "import re" not in source_text:
-                  print("ПРЕДУПРЕЖДЕНИЕ: для format_receipt не найдено проверок через регулярные выражения")
+              has_regex = "re." in source_text or "import re" in source_text
+              add_report(
+                  "Проверка формата чека регуляркой",
+                  "OK" if has_regex else "WARN",
+                  "" if has_regex else "регулярные выражения не используются",
+              )
 
-          print("Все структурные проверки тестов пройдены")
+          # ---------- Итоговый отчёт ----------
+          print()
+          print("=" * 70)
+          print(" ОТЧЁТ О ПРОВЕРКЕ ТЕСТОВ")
+          print("=" * 70)
+          for section, status, details in report:
+              line = f"  [{status:4}] {section}"
+              if details:
+                  line += f" — {details}"
+              print(line)
+          print("=" * 70)
+
+          if errors:
+              print(f"РЕЗУЛЬТАТ: FAIL ({len(errors)} проблем)")
+              for e in errors:
+                  print(f"  - {e}")
+              sys.exit(1)
+          else:
+              print("РЕЗУЛЬТАТ: OK — все проверки пройдены")
+          print("=" * 70)
           EOF
